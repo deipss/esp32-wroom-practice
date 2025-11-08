@@ -131,20 +131,24 @@ print("===== 系统启动（中断+线程版） =====")
 n = 0
 last_led_state = 1
 
-while True:
-    # LED按键轮询控制（实时点亮/熄灭）
-    curr_led_state = btn_led.value()
-    if curr_led_state == 0 and last_led_state == 1:
-        led_pin.on()
-        print("[主循环] LED点亮")
-    elif curr_led_state == 1 and last_led_state == 0:
-        led_pin.off()
-        print("[主循环] LED熄灭")
-    last_led_state = curr_led_state
+if __name__ == '__main__':
 
-    # 数码管递增显示（持续刷新，不受阻塞）
-    tm.number(n)
-    n = (n + 1) % 10000
+    while True:
+        # LED按键轮询控制（实时点亮/熄灭）
+        curr_led_state = btn_led.value()
+        if curr_led_state == 0 and last_led_state == 1:
+            led_pin.on()
+            print("[主循环] LED点亮")
+        elif curr_led_state == 1 and last_led_state == 0:
+            led_pin.off()
+            print("[主循环] LED熄灭")
+        last_led_state = curr_led_state
 
-    # 稍作延迟
-    time.sleep_ms(100)
+        # 数码管递增显示（持续刷新，不受阻塞）
+        tm.number(n)
+        n = (n + 1) % 10000
+
+        # 稍作延迟
+        time.sleep_ms(100)
+
+

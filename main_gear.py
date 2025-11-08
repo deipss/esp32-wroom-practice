@@ -1,200 +1,166 @@
+# stepper_keys_angles.py
+# ESP32 + 四相步进(ULN2003/28BYJ-48) + 4键非阻塞控制
+# K1/K2/K3/K4 -> +90° / +180° / -90° / +360°
 import time
-import gc
-from machine import Pin, PWM
-try:
-    import network
-except:
-    network = None
+from machine import Pin
+import micropython
 
-# ======================
-# 日志系统
-# ======================
-# 0=ERROR, 1=INFO, 2=DEBUG, 3=TRACE
-LOG_LEVEL = 2
+# 允许中断抛异常/缓冲
+micropython.alloc_emergency_exception_buf(128)
 
-def _now_ms():
-    return time.ticks_ms()
-
-def _fmt_ms(ms):
-    return "{:>8d}ms".format(ms)
-
-def log(level, msg, *args):
-    if level <= LOG_LEVEL:
+# ===== 日志 =====
+LOG_LEVEL = 2  # 0=ERR,1=INF,2=DBG,3=TRC
+def _now_ms(): return time.ticks_ms()
+def _fmt(ms): return "{:>8d}ms".format(ms)
+def log(lv, msg, *args):
+    if lv <= LOG_LEVEL:
         try:
-            print("[{}] {} | ".format(
-                ("ERR","INF","DBG","TRC")[level],
-                _fmt_ms(_now_ms())
-            ) + (msg % args if args else msg))
-        except Exception as e:
-            # 打印格式化失败也不能影响主逻辑
-            print("[LOG-FAIL]", msg, args, e)
+            print("[{}] {} | ".format(("ERR","INF","DBG","TRC")[lv], _fmt(_now_ms())) + (msg % args if args else msg))
+        except:
+            pass
+ERR, INF, DBG, TRC = 0,1,2,3
 
-ERR, INF, DBG, TRC = 0, 1, 2, 3
+# ===== 引脚配置（建议）=====
+MOTOR_PINS = (16, 17, 18, 19)   # ULN2003 IN1..IN4
+KEY_PINS   = (25, 26, 27, 14)   # K1..K4，内部上拉：按下=0
+DEBOUNCE_MS = 40
 
-# ======================
-# 硬件引脚
-# ======================
-btn1 = Pin(25, Pin.IN, Pin.PULL_UP)  # 长按触发锁存
-btn2 = Pin(26, Pin.IN, Pin.PULL_UP)
-btn3 = Pin(27, Pin.IN, Pin.PULL_UP)
-btn4 = Pin(14, Pin.IN, Pin.PULL_UP)
+# ===== 步进参数 =====
+STEPS_PER_REV   = 4096          # 28BYJ-48 半步圈数（批次不同可调）
+STEP_DELAY_US   = 1200          # 单步间隔（调快/慢）
+RELEASE_WHEN_IDLE = True        # 到位后断电线圈
+DIR_INVERT      = False         # 方向反了就 True
 
-led_pin = Pin(15, Pin.OUT)
+# 半步序列（IN1..IN4）
+HALFSTEP_SEQ = (
+    (1,0,0,0),
+    (1,1,0,0),
+    (0,1,0,0),
+    (0,1,1,0),
+    (0,0,1,0),
+    (0,0,1,1),
+    (0,0,0,1),
+    (1,0,0,1),
+)
 
-# ======================
-# 参数
-# ======================
-LONG_PRESS_MS = 1200  # 长按阈值
-DEBOUNCE_MS   = 30    # 去抖时间
-MAIN_LOOP_DELAY_MS = 5
-HEARTBEAT_MS = 1000   # 心跳打印间隔（状态速览）
+# ===== 按键角度映射（这里改就行）=====
+ANGLE_MAP = {1:+90, 2:+180, 3:-90, 4:+360}
 
-# ======================
-# 运行时状态
-# ======================
-_last_raw_1 = 1
-_stable_1 = 1
-_last_debounce_time_1 = 0
-_press_start_time_1 = None
-_latched_on = False
-_bounce_count = 0
-_last_heartbeat = 0
+# ===== 硬件对象 =====
+in_pins = [Pin(n, Pin.OUT, value=0) for n in MOTOR_PINS]
+keys    = [Pin(n, Pin.IN, Pin.PULL_UP) for n in KEY_PINS]
 
+# ===== 运行状态 =====
+seq_idx = 0
+steps_remaining = 0
+last_step_us = 0
+_last_k_ms = [0,0,0,0]
+_pending_key = [0,0,0,0]     # IRQ里置位，软中断/主循环处理
 
-def clear_esp32_state():
-    log(INF, "清理 ESP32 可能残留状态...")
-    # 1) 网络
-    if network is not None:
-        try:
-            sta = network.WLAN(network.STA_IF)
-            ap  = network.WLAN(network.AP_IF)
-            if sta.active():
-                log(DBG, "关闭 STA")
-                sta.active(False)
-            if ap.active():
-                log(DBG, "关闭 AP")
-                ap.active(False)
-        except Exception as e:
-            log(DBG, "关闭网络忽略异常: %s", repr(e))
+# ===== 基础函数 =====
+def _write_coils(a,b,c,d):
+    in_pins[0].value(a); in_pins[1].value(b); in_pins[2].value(c); in_pins[3].value(d)
 
-    # 2) 清理可能残留的中断
-    try:
-        btn1.irq(handler=None); btn2.irq(handler=None)
-        btn3.irq(handler=None); btn4.irq(handler=None)
-        log(DBG, "已清除按键 IRQ 回调")
-    except Exception as e:
-        log(DBG, "清 IRQ 忽略异常: %s", repr(e))
+def _release():
+    _write_coils(0,0,0,0)
 
-    # 3) 15 脚恢复为普通输出并拉低
-    try:
-        led_pin.init(mode=Pin.OUT, pull=None)
-        led_pin.off()
-        log(DBG, "15脚已设为GPIO输出并拉低")
-    except Exception as e:
-        log(DBG, "配置 15脚 忽略异常: %s", repr(e))
+def angle_to_steps(deg):
+    s = int(deg * STEPS_PER_REV / 360.0)
+    return -s if DIR_INVERT else s
 
-    # 4) 若 15 脚遗留 PWM，尝试解除
-    try:
-        _tmp_pwm = PWM(led_pin)
-        _tmp_pwm.deinit()
-        led_pin.off()
-        log(DBG, "尝试解除 15脚 PWM 绑定（若存在）")
-    except Exception as e:
-        log(TRC, "解除 PWM 忽略异常(多为正常): %s", repr(e))
+def enqueue(steps):
+    global steps_remaining
+    steps_remaining += steps
+    log(INF, "加入任务: %+d 步（剩余 %+d）", steps, steps_remaining)
 
-    # 5) GC
-    try:
-        gc.collect()
-        log(DBG, "GC 完成，剩余内存未显示（Micropython不同固件接口不一）")
-    except Exception as e:
-        log(DBG, "GC 忽略异常: %s", repr(e))
+def step_once(direction):
+    global seq_idx
+    seq_idx = (seq_idx + (1 if direction>0 else -1)) & 0x7
+    _write_coils(*HALFSTEP_SEQ[seq_idx])
 
-
-def clear_state():
-    global _last_raw_1, _stable_1, _last_debounce_time_1, _press_start_time_1, _latched_on, _bounce_count
-    led_pin.off()
-    _last_debounce_time_1 = _now_ms()
-    _press_start_time_1 = None
-    _latched_on = False
-    _bounce_count = 0
-
-    raw = btn1.value()
-    _last_raw_1 = raw
-    _stable_1 = raw
-
-    # 同步其他按键的电平一次（仅日志）
-    r2, r3, r4 = btn2.value(), btn3.value(), btn4.value()
-    log(INF, "清程序状态：key1=%d, key2=%d, key3=%d, key4=%d, 15脚=%d",
-        raw, r2, r3, r4, led_pin.value())
-
-
-def _trace_edges_and_debounce():
-    """处理 key1 的去抖与稳定态转换，输出细粒度日志。"""
-    global _last_raw_1, _stable_1, _last_debounce_time_1, _bounce_count, _press_start_time_1
-    raw = btn1.value()
-
-    if raw != _last_raw_1:
-        # 原始读数变化（可能是抖动）
-        _last_raw_1 = raw
-        _last_debounce_time_1 = _now_ms()
-        _bounce_count += 1
-        log(TRC, "原始变化 raw=%d（累计抖动=%d）", raw, _bounce_count)
-
-    # 稳定判定
-    if time.ticks_diff(_now_ms(), _last_debounce_time_1) > DEBOUNCE_MS:
-        if raw != _stable_1:
-            prev = _stable_1
-            _stable_1 = raw
-            log(DBG, "稳定态切换 %d -> %d (去抖=%dms)",
-                prev, _stable_1, DEBOUNCE_MS)
-            if _stable_1 == 0:  # 按下
-                _press_start_time_1 = _now_ms()
-                log(DBG, "按下稳定，开始计时 t0=%s", _fmt_ms(_press_start_time_1))
-            else:
-                # 松开
-                if _press_start_time_1 is not None:
-                    held = time.ticks_diff(_now_ms(), _press_start_time_1)
-                    log(DBG, "松开稳定，按住时长=%dms", held)
-                _press_start_time_1 = None
-
-    return raw, _stable_1
-
-
-def _check_long_press_and_latch():
-    global _latched_on
-    if (_stable_1 == 0) and (not _latched_on) and (_press_start_time_1 is not None):
-        held = time.ticks_diff(_now_ms(), _press_start_time_1)
-        if held >= LONG_PRESS_MS:
-            led_pin.on()
-            _latched_on = True
-            log(INF, "【长按达阈值】held=%dms -> 15脚置1并锁存", held)
-
-
-def _heartbeat():
-    global _last_heartbeat
+# ===== 软中断处理（做去抖、入队、打印）=====
+def _process_key_soft(i):
+    _pending_key[i] = 0
     now = _now_ms()
-    if time.ticks_diff(now, _last_heartbeat) >= HEARTBEAT_MS:
-        _last_heartbeat = now
-        # 输出一眼可见的关键状态
-        log(INF, "心跳: raw=%d stable=%d latched=%s led15=%d %s",
-            _last_raw_1, _stable_1, _latched_on, led_pin.value(),
-            "(按下计时中)" if _press_start_time_1 is not None else "")
+    if time.ticks_diff(now, _last_k_ms[i]) < DEBOUNCE_MS:
+        return
+    _last_k_ms[i] = now
+    if keys[i].value() == 0:            # 按下=0
+        deg = ANGLE_MAP[i+1]
+        enqueue(angle_to_steps(deg))
+        log(DBG, "K%d 按下 -> 角度 %+d°", i+1, deg)
 
+# ===== 硬中断（极简：只置位 + schedule）=====
+def _mk_irq(i):
+    def _irq(pin):
+        now = _now_ms()
+        if time.ticks_diff(now, _last_k_ms[i]) < DEBOUNCE_MS:
+            return
+        _last_k_ms[i] = now
+        if _pending_key[i] == 0:
+            _pending_key[i] = 1
+            try:
+                micropython.schedule(lambda _: _process_key_soft(i), 0)
+            except:
+                # 队列满让主循环兜底
+                pass
+    return _irq
 
+def bind_irqs():
+    for i, kp in enumerate(keys):
+        kp.irq(trigger=Pin.IRQ_FALLING, handler=_mk_irq(i))  # 上拉，按下=下降沿
+    log(INF, "按键 IRQ 绑定: K=%s", KEY_PINS)
+
+# ===== 自检（可留可去）=====
+def self_test():
+    log(INF, "自检：正转 32 半步")
+    for _ in range(32):
+        step_once(+1 if not DIR_INVERT else -1)
+        time.sleep_us(max(STEP_DELAY_US, 800))
+    _release(); time.sleep_ms(300)
+    log(INF, "自检：反转 32 半步")
+    for _ in range(32):
+        step_once(-1 if not DIR_INVERT else +1)
+        time.sleep_us(max(STEP_DELAY_US, 800))
+    if RELEASE_WHEN_IDLE: _release()
+    log(INF, "自检完成。")
+
+# ===== 主循环 =====
 def main():
-    log(INF, "==== 启动 ====")
-    clear_esp32_state()
-    clear_state()
+    global last_step_us, steps_remaining
+    log(INF, "==== 步进控制启动 ====")
+    log(INF, "IN=%s  K=%s  半步/圈=%d  步延时=%dus  DIR_INV=%s",
+        MOTOR_PINS, KEY_PINS, STEPS_PER_REV, STEP_DELAY_US, DIR_INVERT)
 
-    log(INF, "参数：LONG_PRESS_MS=%d, DEBOUNCE_MS=%d, LOG_LEVEL=%d", LONG_PRESS_MS, DEBOUNCE_MS, LOG_LEVEL)
-    log(INF, "提示：LOG_LEVEL=3 可打开 TRACE 逐读日志（更详细）")
+    bind_irqs()
+    self_test()
+    _release()
 
+    last_hb = _now_ms()
     while True:
-        _trace_edges_and_debounce()
-        _check_long_press_and_latch()
-        _heartbeat()
-        time.sleep_ms(MAIN_LOOP_DELAY_MS)
+        # 兜底：若 schedule 忙，这里轮询 pending 位
+        for i in range(4):
+            if _pending_key[i]:
+                _process_key_soft(i)
 
+        # 非阻塞走步
+        if steps_remaining != 0:
+            now_us = time.ticks_us()
+            if time.ticks_diff(now_us, last_step_us) >= STEP_DELAY_US:
+                last_step_us = now_us
+                dir_sign = 1 if steps_remaining > 0 else -1
+                step_once(dir_sign)
+                steps_remaining -= dir_sign
+                if steps_remaining == 0 and RELEASE_WHEN_IDLE:
+                    _release(); log(DBG, "到位 -> 断电线圈")
+        else:
+            time.sleep_ms(2)
+
+        # 心跳（顺便显示键位物理读数：1=未按，0=按下）
+        if time.ticks_diff(_now_ms(), last_hb) >= 1000:
+            last_hb = _now_ms()
+            ks = "".join(str(k.value()) for k in keys)
+            log(INF, "心跳：rem=%+d idx=%d keys=%s", steps_remaining, seq_idx, ks)
 
 if __name__ == "__main__":
     main()
