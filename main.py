@@ -1,6 +1,6 @@
 # main.py
 # 选择要运行的示例：distance / rotary / laser / light / lcd1602 / gear
-DEMO = "phonotelemeter"
+DEMO = "test"
 
 if DEMO == "phonotelemeter":
     import examples.phonotelemeter as app

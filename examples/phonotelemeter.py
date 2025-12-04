@@ -10,9 +10,11 @@ micropython.alloc_emergency_exception_buf(128)
 
 # 硬件参数
 BTN_PINS       = (25, 26, 27, 14)  # 四键保留，K1 = 第一个
+
 LATCH_OUT_PIN  = 15
 TRIG_PIN       = 22
 ECHO_PIN       = 21
+
 MEAS_PERIOD_MS = 100
 LONG_PRESS_MS  = 1200
 DEBOUNCE_MS    = 30

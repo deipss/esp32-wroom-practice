@@ -1,3 +1,4 @@
+# 摇杆
 import time
 from machine import Pin, ADC
 
