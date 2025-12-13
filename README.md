@@ -25,9 +25,11 @@ esptool erase_flash
 esptool --baud 460800 write_flash 0x1000 ESP32_BOARD_NAME-DATE-VERSION.bin
 
  ls /dev/cu.*    
- esptool --port  /dev/cu.usbserial-130 erase_flash  
+ esptool --port  /dev/cu.usbserial-120 erase-flash  
  
- esptool --port /dev/cu.usbserial-130 --baud 460800 write_flash 0x1000 ESP32_GENERIC-20250911-v1.26.1.bin
+ esptool --port /dev/cu.usbserial-120 --baud 460800 write-flash 0x1000 ESP32_GENERIC_S2-20220618-v1.19.1.bin
+ esptool --port /dev/cu.usbserial-120 --baud 460800 write-flash 0x1000 ESP32_GENERIC-20250911-v1.26.1.bin
+
 ```
 
 MicroPython 并不严格对应标准 Python 的某个具体版本（如 3.4），但它的语法和核心特性主要基于 Python 3.4 至 Python 3.6 的特性集，同时针对嵌入式设备的资源限制做了精简和优化。

@@ -15,6 +15,7 @@ FREQ = 50               # 舵机固定频率 50Hz
 MIN_US = 500            # 0° 脉宽 0.5ms
 MAX_US = 2500           # 180° 脉宽 2.5ms
 
+
 # ESP32 PWM 通道：duty范围 0~1023
 PWM_MAX = 1023
 
